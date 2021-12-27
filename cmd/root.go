@@ -10,7 +10,7 @@ import (
 var rootCmd = &cobra.Command{
 	Use:   "prevue",
 	Short: "Prevue is a tool for deploying your local git branch to an instant environment.",
-	Long:  `Prevue is a tool for deploying your local git branch to an instant environment. `,
+	Long:  `Prevue is a tool for deploying your local git branch to an instant environment.`,
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	// Run: func(cmd *cobra.Command, args []string) { },
