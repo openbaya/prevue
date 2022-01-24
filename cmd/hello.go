@@ -19,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ecr"
+	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/archive"
@@ -26,47 +27,63 @@ import (
 )
 
 // helloCmd represents the hello command
-var repo string
 var helloCmd = &cobra.Command{
 	Use:   "hello",
 	Short: "Hello world! command",
 	Long:  `Hello world! command`,
 	Run: func(cmd *cobra.Command, args []string) {
-		// pass, endPoint := getEcrPassword()
-		// fmt.Println(pass, endPoint)
-		// cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-		// if err != nil {
-		// 	fmt.Println(err.Error())
-		// 	return
-		// }
-		// imagePush(cli)
-		svc := ecr.New(session.New(&aws.Config{
-			Region: aws.String("us-east-1")}))
-		input := &ecr.DescribeRepositoriesInput{}
 
-		result, err := svc.DescribeRepositories(input)
+		ecrPassword, ecrServerAddress, err := getEcrPassword()
+
 		if err != nil {
-			if aerr, ok := err.(awserr.Error); ok {
-				switch aerr.Code() {
-				case ecr.ErrCodeServerException:
-					fmt.Println(ecr.ErrCodeServerException, aerr.Error())
-				case ecr.ErrCodeInvalidParameterException:
-					fmt.Println(ecr.ErrCodeInvalidParameterException, aerr.Error())
-				case ecr.ErrCodeRepositoryNotFoundException:
-					fmt.Println(ecr.ErrCodeRepositoryNotFoundException, aerr.Error())
-				default:
-					fmt.Println(aerr.Error())
-				}
-			} else {
-				// Print the error, cast err to awserr.Error to get the Code and
-				// Message from an error.
-				fmt.Println(err.Error())
-			}
+			fmt.Println(err)
 			return
 		}
 
-		fmt.Println(result)
-		//buildImage()
+		// This takes in the server address for our ecr which we get from previous command, the ecr repository name,
+		// I also have afunction to create ECR repo, did not include it in the flow,
+		// Lastly this takes the path of the folder where your docker file is localted.
+		err = buildImage(ecrServerAddress, "prevue-test", "../Refresh/refresh-ui")
+
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// Takes in the password and ecr server addrss from previous command and the ecr repository name
+		err = pushImage(ecrPassword, ecrServerAddress, "prevue-test")
+
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// Takes in the family name fo the task and returns its defintion, if no tag is provided takes in the latest
+
+		describeTaskOutput, err := describeTask("first-run-task-definition")
+
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// Takes in the image you want to deploy and the output recieved fro the describe task definition
+
+		_, err = registerTask(ecrServerAddress+"/"+"prevue-test", describeTaskOutput)
+
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+
+		// Takes in the cluster name, the service name and the task definition family.
+
+		_, err = updateService("prevue", "prevue-service", "first-run-task-definition")
+
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
 	},
 }
 
@@ -83,7 +100,7 @@ func init() {
 	// is called directly, e.g.:
 }
 
-func getEcrPassword() (string, string) {
+func getEcrPassword() (string, string, error) {
 	svc := ecr.New(session.New(&aws.Config{
 		Region: aws.String("us-east-1")}))
 	input := &ecr.GetAuthorizationTokenInput{}
@@ -107,11 +124,15 @@ func getEcrPassword() (string, string) {
 	}
 
 	sEnc, err := base64.StdEncoding.DecodeString(*result.AuthorizationData[0].AuthorizationToken)
-	creds := strings.Split(string(sEnc), ":")
-	return creds[1], *result.AuthorizationData[0].ProxyEndpoint
-}
 
-var dockerRegistryUserID = ""
+	if err != nil {
+		return "", "", err
+	}
+	creds := strings.Split(string(sEnc), ":")
+	endpoint := *result.AuthorizationData[0].ProxyEndpoint
+	endpoint = endpoint[8:] // removing the "https://" from endpoint
+	return creds[1], endpoint, nil
+}
 
 type ErrorLine struct {
 	Error       string      `json:"error"`
@@ -122,33 +143,46 @@ type ErrorDetail struct {
 	Message string `json:"message"`
 }
 
-func buildImage() {
+func buildImage(serverAddress, repositoryName, targetPath string) error {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
-		fmt.Println(err.Error())
-		return
+		return err
 	}
 
-	err = imageBuild(cli)
+	err = imageBuild(cli, serverAddress, repositoryName, targetPath)
 	if err != nil {
-		fmt.Println(err.Error())
-		return
+		return err
 	}
+	return nil
 }
 
-func imageBuild(dockerClient *client.Client) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
+func pushImage(password, serverAddress, repositoryName string) error {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+
+	err = imagePush(cli, password, serverAddress, repositoryName)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func imageBuild(dockerClient *client.Client, serverAddress string, repositoryName string, targetPath string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120000)
 	defer cancel()
 
-	tar, err := archive.TarWithOptions("../node-hello/", &archive.TarOptions{})
+	tar, err := archive.TarWithOptions(targetPath, &archive.TarOptions{})
 	if err != nil {
 		return err
 	}
 
 	opts := types.ImageBuildOptions{
 		Dockerfile: "Dockerfile",
-		Tags:       []string{"194428793924.dkr.ecr.us-east-1.amazonaws.com/prevue-test"},
-		Remove:     true,
+		//Tags:       []string{"809789629378.dkr.ecr.us-east-1.amazonaws.com/prevue-test"},
+		Tags:   []string{serverAddress + "/" + repositoryName},
+		Remove: true,
 	}
 	res, err := dockerClient.ImageBuild(ctx, tar, opts)
 	if err != nil {
@@ -187,20 +221,22 @@ func print(rd io.Reader) error {
 	return nil
 }
 
-func imagePush(dockerClient *client.Client) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*120)
+func imagePush(dockerClient *client.Client, password string, serverAddress string, repositoryName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*12000)
 	defer cancel()
 
 	var authConfig = types.AuthConfig{
-		Username:      "AWS",
-		Password:      "eyJwYXlsb2FkIjoidTUxTEppVzVtYnduNkN3bGVibWVBWTZMRnRDbm1WdjIzdzRzZjkrdkZVRmZ4UkRCbWNmbmxUYzAxd1JpR1p4WEZJTU5DczM4a05IeTRqYkdoamJwYmh6SlNmZ1NsRjJXTzJyTWNvTC8zQjU4bXg0V28yV2pobGtINDJXbTBzeHlpN3ROQ0dHb0lVYkZ3K1Fxbmh3UWVNejd5RDFBeS9sNVcvQXA3QWNlak91YmZkbDVTNDVYZlNKcGlBZmNlakN0NjJMYUpTejZ1WEdPTlE4YTIzcFM5QUFHc2pxMC9yejQyOUtGS2loVk0wcXRKSU5GS0xKVllPT2F6Qmo0dzhIeGpKQmZkMnJuWnIxeHp5RTZxZGdqd1BmcDlDUGZBaVQvbitnbmdpRjVmZWNScGpkKzQ1ZHM5MmtQcVV0dEVsN1ROVHJyamdDZHpueEp2QTJpNjltalk5eHVJUHA2TXExNXFtZTNNWi95dElZaDlWbUhNZzk3Nlk5NmozZG9rTTQ1N0lDMnh3RXlhWWFWck1ZTk9ldDRuVEJ0b21DZ2w1Y0Z3c2NWUFlpZWVKV2taTXROVllNZjFhaWdyeG93cEM1YnVmOG40MzV3M1UrVFJwZngxWDJ2enh4RDJSYlh6OWZhQ0lXYVk4OHdNTWtGdjVHS1RtbWliQ09QZ0JoRGxaMXVjZUxRT0dOVjVhRGJtZDloTytCN1RqeVdTWkJoWVd4clUyVUREQllIT0Z0YktYS2FiNEpna3ZjRjFKNVZQdFgvVmdHRlJTNkhhOWNvcENZN0Nub0RrWXlZazNNRVBUNmROMVJkVUUzYXMzVjFUSDVqVjJVelhvWTY2MXI0dkNjYkpwbE42bG0vc3d0aG5JN3V3S2U0Q3BUelpjeUVzdWdGQkh3Nzlvdmp0VlNHVDRCamJyWk9hZHo1M2YyeG1lNFgveWFyeFNyNlhnME4yWjlKQ0Z5TnZVSThxUEJuSjE5Q0FiNVpsVFpia3pVd2VkMFpaV3I1MmZDNTJMSHhzcXFaQWtPU2s1ZXBSV3RnVmVXd2lQWHRoZkorQ1htM1k2M3daVkUweVB0dVFBNlJndCtKbEF0TXhmYUpmbkltUmdpS1Z5S21JbGQwZS9FUmJyOW14K2EyQUd5azJNOFFnOFY3ZlFzMzBCTmlKTlZMTXRIOHlWd1lNMnBXZ3lBYUdLNlAzQmV2eDlCcDA5SGpmNE13YytEVGVtWmJBSnlmMEZQN1NjcjMwSjNYdHIxQTIxRjNkaHNRTFVVMjBJZ1JkV25nSEQ5TWgyR1RINnRQTWRqakk5Vm43NjUwKzh2WVRaMDV3OHo0amdObEJtT21tdWg1MG1qQ1IwVU5JR0tSVDZWeDRzLzRONWp4aGpTK2dzT1dXMkgrSEFocFNGaFdzWUVGWmc9PSIsImRhdGFrZXkiOiJBUUVCQUhod20wWWFJU0plUnRKbTVuMUc2dXFlZWtYdW9YWFBlNVVGY2U5UnE4LzE0d0FBQUg0d2ZBWUpLb1pJaHZjTkFRY0dvRzh3YlFJQkFEQm9CZ2txaGtpRzl3MEJCd0V3SGdZSllJWklBV1VEQkFFdU1CRUVES0ZlbmRSNXVKYUNnWDFvQ1FJQkVJQTdoUUNjTmFzejJ5S0ZwTFpJZWh4b2lsN2hDUGp5TFBRanR5aXhqYzFZR282c09WcGRCenBBTm8wZXpMUzNwckxMOCtoNEE4T3RBUklLRUFNPSIsInZlcnNpb24iOiIyIiwidHlwZSI6IkRBVEFfS0VZIiwiZXhwaXJhdGlvbiI6MTY0MTQyMDYzNH0=",
-		ServerAddress: "194428793924.dkr.ecr.us-east-1.amazonaws.com",
+		Username: "AWS",
+		Password: password,
+		//ServerAddress: "809789629378.dkr.ecr.us-east-1.amazonaws.com",
+		ServerAddress: serverAddress,
 	}
 
 	authConfigBytes, _ := json.Marshal(authConfig)
 	authConfigEncoded := base64.URLEncoding.EncodeToString(authConfigBytes)
 
-	tag := "194428793924.dkr.ecr.us-east-1.amazonaws.com/prevue-test"
+	//tag := "809789629378.dkr.ecr.us-east-1.amazonaws.com/prevue-test"
+	tag := serverAddress + "/" + repositoryName
 	opts := types.ImagePushOptions{RegistryAuth: authConfigEncoded}
 	rd, err := dockerClient.ImagePush(ctx, tag, opts)
 	if err != nil {
@@ -215,4 +251,192 @@ func imagePush(dockerClient *client.Client) error {
 	}
 
 	return nil
+}
+
+func registerTask(image string, inp *ecs.DescribeTaskDefinitionOutput) (*ecs.RegisterTaskDefinitionOutput, error) {
+
+	svc := ecs.New(session.New(&aws.Config{
+		Region: aws.String("us-east-1")}))
+
+	containerDef := inp.TaskDefinition.ContainerDefinitions
+	containerDef[0].Image = aws.String(image)
+	input := &ecs.RegisterTaskDefinitionInput{
+		ContainerDefinitions:    inp.TaskDefinition.ContainerDefinitions,
+		Family:                  aws.String(*inp.TaskDefinition.Family),
+		ExecutionRoleArn:        aws.String(*inp.TaskDefinition.ExecutionRoleArn),
+		Cpu:                     aws.String(*inp.TaskDefinition.Cpu),
+		Memory:                  aws.String(*inp.TaskDefinition.Memory),
+		NetworkMode:             aws.String(*inp.TaskDefinition.NetworkMode),
+		RequiresCompatibilities: *&inp.TaskDefinition.RequiresCompatibilities,
+
+		//need to see other fields that can be added here or how do they work
+	}
+
+	var result *ecs.RegisterTaskDefinitionOutput
+	result, err := svc.RegisterTaskDefinition(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case ecs.ErrCodeServerException:
+				fmt.Println(ecs.ErrCodeServerException, aerr.Error())
+			case ecs.ErrCodeClientException:
+				fmt.Println(ecs.ErrCodeClientException, aerr.Error())
+			case ecs.ErrCodeInvalidParameterException:
+				fmt.Println(ecs.ErrCodeInvalidParameterException, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+		return result, err
+	}
+
+	return result, nil
+}
+
+func describeTask(taskDefinitionFamily string) (*ecs.DescribeTaskDefinitionOutput, error) {
+	svc := ecs.New(session.New(&aws.Config{
+		Region: aws.String("us-east-1")}))
+	input := &ecs.DescribeTaskDefinitionInput{
+		TaskDefinition: aws.String(taskDefinitionFamily),
+	}
+	var result *ecs.DescribeTaskDefinitionOutput
+	result, err := svc.DescribeTaskDefinition(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case ecs.ErrCodeServerException:
+				fmt.Println(ecs.ErrCodeServerException, aerr.Error())
+			case ecs.ErrCodeClientException:
+				fmt.Println(ecs.ErrCodeClientException, aerr.Error())
+			case ecs.ErrCodeInvalidParameterException:
+				fmt.Println(ecs.ErrCodeInvalidParameterException, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+			return result, err
+		}
+	}
+
+	return result, nil
+}
+
+func updateService(clusterName, serviceName, taskDefinitionFamily string) (*ecs.UpdateServiceOutput, error) {
+	svc := ecs.New(session.New(&aws.Config{
+		Region: aws.String("us-east-1")}))
+	input := &ecs.UpdateServiceInput{
+		Cluster:            aws.String(clusterName),
+		Service:            aws.String(serviceName),
+		TaskDefinition:     aws.String(taskDefinitionFamily),
+		ForceNewDeployment: aws.Bool(true),
+	}
+	var result *ecs.UpdateServiceOutput
+	result, err := svc.UpdateService(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case ecs.ErrCodeServerException:
+				fmt.Println(ecs.ErrCodeServerException, aerr.Error())
+			case ecs.ErrCodeClientException:
+				fmt.Println(ecs.ErrCodeClientException, aerr.Error())
+			case ecs.ErrCodeInvalidParameterException:
+				fmt.Println(ecs.ErrCodeInvalidParameterException, aerr.Error())
+			case ecs.ErrCodeClusterNotFoundException:
+				fmt.Println(ecs.ErrCodeClusterNotFoundException, aerr.Error())
+			case ecs.ErrCodeServiceNotFoundException:
+				fmt.Println(ecs.ErrCodeServiceNotFoundException, aerr.Error())
+			case ecs.ErrCodeServiceNotActiveException:
+				fmt.Println(ecs.ErrCodeServiceNotActiveException, aerr.Error())
+			case ecs.ErrCodePlatformUnknownException:
+				fmt.Println(ecs.ErrCodePlatformUnknownException, aerr.Error())
+			case ecs.ErrCodePlatformTaskDefinitionIncompatibilityException:
+				fmt.Println(ecs.ErrCodePlatformTaskDefinitionIncompatibilityException, aerr.Error())
+			case ecs.ErrCodeAccessDeniedException:
+				fmt.Println(ecs.ErrCodeAccessDeniedException, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+		return result, err
+	}
+
+	return result, nil
+}
+
+func DescribeRepositories() (*ecr.DescribeRepositoriesOutput, error) {
+	svc := ecr.New(session.New(&aws.Config{
+		Region: aws.String("us-east-1")}))
+	input := &ecr.DescribeRepositoriesInput{}
+	var result *ecr.DescribeRepositoriesOutput
+	_, err := svc.DescribeRepositories(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case ecr.ErrCodeServerException:
+				fmt.Println(ecr.ErrCodeServerException, aerr.Error())
+			case ecr.ErrCodeInvalidParameterException:
+				fmt.Println(ecr.ErrCodeInvalidParameterException, aerr.Error())
+			case ecr.ErrCodeRepositoryNotFoundException:
+				fmt.Println(ecr.ErrCodeRepositoryNotFoundException, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+		return result, err
+	}
+
+	return result, nil
+}
+
+func CreateRepository(name string) (*ecr.CreateRepositoryOutput, error) {
+	svc := ecr.New(session.New(&aws.Config{
+		Region: aws.String("us-east-1")}))
+	input := &ecr.CreateRepositoryInput{
+		RepositoryName: aws.String(name),
+	}
+	var result *ecr.CreateRepositoryOutput
+	result, err := svc.CreateRepository(input)
+	if err != nil {
+		if aerr, ok := err.(awserr.Error); ok {
+			switch aerr.Code() {
+			case ecr.ErrCodeServerException:
+				fmt.Println(ecr.ErrCodeServerException, aerr.Error())
+			case ecr.ErrCodeInvalidParameterException:
+				fmt.Println(ecr.ErrCodeInvalidParameterException, aerr.Error())
+			case ecr.ErrCodeInvalidTagParameterException:
+				fmt.Println(ecr.ErrCodeInvalidTagParameterException, aerr.Error())
+			case ecr.ErrCodeTooManyTagsException:
+				fmt.Println(ecr.ErrCodeTooManyTagsException, aerr.Error())
+			case ecr.ErrCodeRepositoryAlreadyExistsException:
+				fmt.Println(ecr.ErrCodeRepositoryAlreadyExistsException, aerr.Error())
+			case ecr.ErrCodeLimitExceededException:
+				fmt.Println(ecr.ErrCodeLimitExceededException, aerr.Error())
+			case ecr.ErrCodeKmsException:
+				fmt.Println(ecr.ErrCodeKmsException, aerr.Error())
+			default:
+				fmt.Println(aerr.Error())
+			}
+		} else {
+			// Print the error, cast err to awserr.Error to get the Code and
+			// Message from an error.
+			fmt.Println(err.Error())
+		}
+		return result, err
+	}
+	return result, nil
 }
